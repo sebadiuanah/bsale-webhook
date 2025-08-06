@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config(); 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -10,38 +10,37 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 🔁 Función retry para obtener la orden
-async function fetchOrderWithRetry(order_id, retries = 5, delay = 1000) {
-  for (let i = 0; i < retries; i++) {
-    const { data, error } = await supabase
-      .from('orders')
-      .select('*')
-      .eq('id', order_id)
-      .single();
-
-    if (data && !error) return data;
-
-    console.log(`⌛ Intento ${i + 1}: Orden no disponible aún, esperando ${delay}ms...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
-  }
-  throw new Error('Orden no encontrada tras varios intentos');
-}
-
 app.post('/api/bsale', async (req, res) => {
   const { order_id } = req.body;
 
   if (!order_id) {
-    console.log(⚠️ Falta order_id');
+    console.log('⚠️ Falta order_id');
     return res.status(400).json({ error: 'Falta order_id' });
   }
 
   console.log(`✅ Recibido pedido con ID: ${order_id}`);
 
-  let order;
-  try {
-    order = await fetchOrderWithRetry(order_id);
-  } catch (err) {
-    console.error('❌ No se pudo obtener la orden:', err.message);
+  // Intentamos varias veces para esperar sincronización de Supabase
+  let order = null;
+  let orderError = null;
+
+  for (let intento = 1; intento <= 5; intento++) {
+    const result = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', order_id)
+      .single();
+
+    order = result.data;
+    orderError = result.error;
+
+    if (order) break;
+    console.log(`⌛ Intento ${intento}: orden aún no sincronizada...`);
+    await new Promise(resolve => setTimeout(resolve, 1000)); // esperar 1 segundo
+  }
+
+  if (orderError || !order) {
+    console.log('❌ Orden no encontrada o error:', orderError);
     return res.status(404).json({ error: 'Orden no encontrada' });
   }
 
@@ -62,7 +61,7 @@ app.post('/api/bsale', async (req, res) => {
     return res.status(400).json({ error: 'No se encontraron ítems' });
   }
 
-  console.log('🧾 Ítems obtenidos:', items);
+  console.log('📦 Ítems obtenidos:', items);
 
   const products = items.map(item => ({
     quantity: item.quantity,
@@ -71,7 +70,7 @@ app.post('/api/bsale', async (req, res) => {
     code: item.products?.sku || ''
   }));
 
-  console.log('🛍️ Productos preparados para Bsale:', products);
+  console.log('🛍️ Productos formateados para Bsale:', products);
 
   try {
     const response = await axios.post('https://api.bsale.cl/v1/documents.json', {
@@ -90,17 +89,14 @@ app.post('/api/bsale', async (req, res) => {
       }
     });
 
-    console.log('✅ Bsale respondió:', response.data);
+    console.log('✅ Respuesta de Bsale:', response.data);
 
     await supabase
       .from('orders')
       .update({ status: 'enviada' })
       .eq('id', order_id);
 
-    return res.status(200).json({
-      message: 'Nota enviada a Bsale',
-      bsale_response: response.data
-    });
+    return res.status(200).json({ message: 'Nota enviada a Bsale', bsale_response: response.data });
 
   } catch (error) {
     console.error('❌ Error al enviar a Bsale:', error.response?.data || error.message);
