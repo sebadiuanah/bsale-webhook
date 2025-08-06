@@ -10,66 +10,73 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-app.post('/api/bsale', async (req, res) => {
-  const { order_id } = req.body;
-
-  if (!order_id) {
-    console.log('⚠️ Falta order_id');
-    return res.status(400).json({ error: 'Falta order_id' });
-  }
-
-  console.log(`✅ Recibido pedido con ID: ${order_id}`);
-
-  try {
-    // 1. Obtener orden
-    const { data: order, error: orderError } = await supabase
+// 🔁 Función retry para obtener la orden
+async function fetchOrderWithRetry(order_id, retries = 5, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    const { data, error } = await supabase
       .from('orders')
       .select('*')
       .eq('id', order_id)
       .single();
 
-    if (orderError || !order) {
-      console.log('❌ Orden no encontrada o error:', orderError);
-      return res.status(404).json({ error: 'Orden no encontrada' });
-    }
+    if (data && !error) return data;
 
-    console.log('📦 Orden obtenida:', order);
+    console.log(`⌛ Intento ${i + 1}: Orden no disponible aún, esperando ${delay}ms...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+  throw new Error('Orden no encontrada tras varios intentos');
+}
 
-    if (order.status !== 'pending') {
-      console.log('⚠️ Orden no está pendiente');
-      return res.status(400).json({ error: 'Orden no está pendiente' });
-    }
+app.post('/api/bsale', async (req, res) => {
+  const { order_id } = req.body;
 
-    // 2. Obtener ítems con SKU desde productos
-    const { data: items, error: itemsError } = await supabase
-      .from('order_items')
-      .select('quantity, unit_price, discount_percentage, products(sku)')
-      .eq('order_id', order_id);
+  if (!order_id) {
+    console.log(⚠️ Falta order_id');
+    return res.status(400).json({ error: 'Falta order_id' });
+  }
 
-    if (itemsError) {
-      console.log('❌ Error al obtener ítems:', itemsError);
-      return res.status(500).json({ error: 'Error al obtener ítems' });
-    }
+  console.log(`✅ Recibido pedido con ID: ${order_id}`);
 
-    if (!items || items.length === 0) {
-      console.log('⚠️ Orden sin ítems válidos');
-      return res.status(400).json({ error: 'La orden no tiene ítems válidos' });
-    }
+  let order;
+  try {
+    order = await fetchOrderWithRetry(order_id);
+  } catch (err) {
+    console.error('❌ No se pudo obtener la orden:', err.message);
+    return res.status(404).json({ error: 'Orden no encontrada' });
+  }
 
-    // 3. Formatear productos para Bsale
-    const products = items.map(item => ({
-      quantity: item.quantity,
-      price: item.unit_price,
-      discount: item.discount_percentage,
-      code: item.products?.sku || ''
-    }));
+  console.log('📦 Orden obtenida:', order);
 
-    console.log('🛍️ Productos formateados para Bsale:', products);
+  if (order.status !== 'pending') {
+    console.log('⚠️ Orden no está pendiente');
+    return res.status(400).json({ error: 'Orden no está pendiente' });
+  }
 
-    // 4. Enviar a Bsale
+  const { data: items, error: itemsError } = await supabase
+    .from('order_items')
+    .select('quantity, unit_price, discount_percentage, products(sku)')
+    .eq('order_id', order_id);
+
+  if (itemsError || !items.length) {
+    console.log('❌ Error al obtener ítems:', itemsError);
+    return res.status(400).json({ error: 'No se encontraron ítems' });
+  }
+
+  console.log('🧾 Ítems obtenidos:', items);
+
+  const products = items.map(item => ({
+    quantity: item.quantity,
+    price: item.unit_price,
+    discount: item.discount_percentage,
+    code: item.products?.sku || ''
+  }));
+
+  console.log('🛍️ Productos preparados para Bsale:', products);
+
+  try {
     const response = await axios.post('https://api.bsale.cl/v1/documents.json', {
-      document_type_id: 1, // Nota de venta
-      office_id: 1,        // ID oficina (modificable)
+      document_type_id: 1,
+      office_id: 1,
       client: {
         activity: 'Venta al por mayor',
         company: 'Mayorista Cliente',
@@ -83,17 +90,12 @@ app.post('/api/bsale', async (req, res) => {
       }
     });
 
-    console.log('✅ Documento creado en Bsale:', response.data);
+    console.log('✅ Bsale respondió:', response.data);
 
-    // 5. Actualizar estado de la orden
-    const { error: updateError } = await supabase
+    await supabase
       .from('orders')
       .update({ status: 'enviada' })
       .eq('id', order_id);
-
-    if (updateError) {
-      console.log('⚠️ Error actualizando estado en Supabase:', updateError);
-    }
 
     return res.status(200).json({
       message: 'Nota enviada a Bsale',
@@ -101,11 +103,8 @@ app.post('/api/bsale', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error inesperado:', error.response?.data || error.message || error);
-    return res.status(500).json({
-      error: 'Error al enviar a Bsale',
-      detail: error.response?.data || error.message || error
-    });
+    console.error('❌ Error al enviar a Bsale:', error.response?.data || error.message);
+    return res.status(500).json({ error: 'Error al enviar a Bsale' });
   }
 });
 
