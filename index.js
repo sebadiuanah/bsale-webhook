@@ -11,7 +11,7 @@ app.post('/api/bsale', async (req, res) => {
     return res.status(400).json({ error: 'Falta order_id' });
   }
 
-  console.log(`📦 Recibido pedido con ID: ${order_id}`);
+  console.log(` Recibido pedido con ID: ${order_id}`);
 
   // Aquí irá la lógica con Supabase y Bsale
 
@@ -20,5 +20,5 @@ app.post('/api/bsale', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
+  console.log(` Servidor escuchando en http://localhost:${PORT}`);
 });
