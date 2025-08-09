@@ -1,177 +1,189 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const { createClient } = require('@supabase/supabase-js');
+"use strict";
 
+/**
+ * BSALE WEBHOOK / POLLER
+ * - Lee órdenes "pending" desde Supabase y las procesa en un loop.
+ * - Endpoint POST /api/bsale para recibir la señal de nueva orden.
+ * - Usa SERVICE ROLE en backend (NUNCA publiques esa key en el código/repo).
+ */
+
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios"); // placeholder si quieres llamar a Bsale
+const { createClient } = require("@supabase/supabase-js");
+
+// =====================
+// Configuración general
+// =====================
 const app = express();
-app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
+app.use(
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 app.use(express.json());
 
-// ⚠️ Usa SERVICE ROLE en backend
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY,
-  { auth: { persistSession: false } }
-);
+// Variables de entorno requeridas
+const SUPABASE_URL =
+  process.env.SUPABASE_URL || "https://<tu-proyecto>.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 
-// Configurables
-const START_DELAY_MS   = 10000;   // espera antes de buscar la orden en /api/bsale
-const POLL_INTERVAL_MS = 30000;   // frecuencia del poller (30s)
-const MAX_BATCH        = 5;       // cuántas órdenes procesa por pasada el poller
+// Nombres de tabla y tiempos
+const ORDERS_TABLE = process.env.ORDERS_TABLE || "orders";
+const START_DELAY_MS = Number(process.env.START_DELAY_MS || 10000); // 10s
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000); // 30s
+const MAX_BATCH = Number(process.env.MAX_BATCH || 5);
 
-// Helpers
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function mapItemsToBsale(details) {
-  return details.map(it => ({
-    quantity: it.quantity,
-    price: it.unit_price,
-    discount: it.discount_percentage,
-    code: it.products?.sku || ''
-  }));
-}
-
-async function fetchOrderAndItems(orderId) {
-  const { data: order, error: orderErr } = await supabase
-    .from('orders')
-    .select('*')
-    .eq('id', orderId)
-    .single();
-
-  if (orderErr || !order) throw new Error('Orden no encontrada');
-
-  const { data: items, error: itemsErr } = await supabase
-    .from('order_items')
-    .select('quantity, unit_price, discount_percentage, products(sku)')
-    .eq('order_id', orderId);
-
-  if (itemsErr || !items?.length) throw new Error('No se encontraron ítems');
-
-  return { order, items };
-}
-
-async function sendToBsale(items) {
-  const payload = {
-    document_type_id: 1,
-    office_id: 1,
-    client: {
-      activity: 'Venta al por mayor',
-      company: 'Mayorista Cliente',
-      identification: '99999999-9',
-    },
-    details: mapItemsToBsale(items),
-  };
-
-  const resp = await axios.post('https://api.bsale.cl/v1/documents.json', payload, {
-    headers: {
-      Authorization: `Bearer ${process.env.BSALE_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 30000,
-  });
-
-  return resp.data;
-}
-
-async function processSingleOrder(orderId) {
-  const { order, items } = await fetchOrderAndItems(orderId);
-  const bsaleResp = await sendToBsale(items);
-  await supabase.from('orders').update({ status: 'enviada' }).eq('id', orderId);
-  return bsaleResp;
-}
-
-/* =========================
-   1) Endpoint con timer
-   ========================= */
-app.post('/api/bsale', async (req, res) => {
-  const { order_id } = req.body || {};
-  if (!order_id) return res.status(400).json({ error: 'Falta order_id' });
-
-  // Respondemos rápido y procesamos con un pequeño delay
-  res.status(202).json({ message: 'Recibido. Se procesará en breve.' });
-
-  (async () => {
-    try {
-      console.log('📩 /api/bsale recibido:', order_id, `→ esperando ${START_DELAY_MS}ms`);
-      await sleep(START_DELAY_MS);
-      await processSingleOrder(order_id);
-      console.log('✅ Orden enviada a Bsale (timer):', order_id);
-    } catch (err) {
-      console.error('❌ Error en timer /api/bsale:', order_id, err?.message || err);
-      // opcional: marcar status='error'
-      await supabase.from('orders').update({ status: 'error' }).eq('id', order_id);
-    }
-  })();
+// =====================
+// Supabase client
+// =====================
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
 });
 
-/* =========================
-   2) Poller en background (con logs + primer tick inmediato)
-   ========================= */
-async function pollPendingOrders() {
-  const startedAt = new Date().toISOString();
-  console.log(`🔁 Poller tick @ ${startedAt}`);
+// =====================
+// Helpers
+// =====================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+async function getPendientes(limit = MAX_BATCH) {
   try {
-    // Buscar órdenes en 'pending'
-    const { data: pending, error } = await supabase
-      .from('orders')
-      .select('id,status')
-      .eq('status', 'pending')
-      .limit(MAX_BATCH);
+    const { data, error } = await supabase
+      .from(ORDERS_TABLE)
+      .select("id, order_number, status")
+      .eq("status", "pending")
+      .order("id", { ascending: true })
+      .limit(limit);
 
-    if (error) {
-      console.error('❌ Poller select error:', error.message);
-      return;
-    }
-
-    if (!pending || pending.length === 0) {
-      console.log('ℹ️ Poller: no hay órdenes pending en este tick');
-      return;
-    }
-
-    console.log(`📝 Poller: encontradas ${pending.length} órdenes`, pending.map(r => r.id));
-
-    // Intentar tomar cada orden con lock optimista
-    for (const row of pending) {
-      const id = row.id;
-
-      const { data: lockData, error: lockErr } = await supabase
-        .from('orders')
-        .update({ status: 'processing' })
-        .eq('id', id)
-        .eq('status', 'pending')
-        .select('id')
-        .single();
-
-      if (lockErr || !lockData) {
-        console.log(`↪️ Poller: orden ${id} no está pending (ya tomada o cambió de estado).`);
-        continue;
-      }
-
-      try {
-        console.log('🛠️ Poller procesando:', id);
-        await processSingleOrder(id);
-        console.log('✅ Poller OK:', id);
-      } catch (err) {
-        console.error('❌ Poller error:', id, err?.message || err);
-        // Devuelve a pending para reintentar más tarde
-        await supabase.from('orders').update({ status: 'pending' }).eq('id', id);
-      }
-    }
+    if (error) throw error;
+    return data || [];
   } catch (e) {
-    console.error('❌ Poller falló:', e?.message || e);
+    console.error("Poller select error:", e.message || e);
+    return [];
   }
 }
 
-// Primer tick inmediato y luego cada N segundos
-pollPendingOrders();
-setInterval(pollPendingOrders, POLL_INTERVAL_MS);
+async function marcarStatus(id, status, extra = {}) {
+  const { error } = await supabase
+    .from(ORDERS_TABLE)
+    .update({ status, ...extra })
+    .eq("id", id);
+  if (error) {
+    console.error(`No se pudo actualizar status de ${id} → ${status}:`, error);
+  }
+}
 
-app.get('/health', (_, res) => res.json({ ok: true }));
+// Placeholder: aquí iría tu llamada real a Bsale
+async function enviarABsale(order) {
+  // Ejemplo ficticio:
+  // const resp = await axios.post("https://bsale.tu-endpoint/api/nota-venta", { ...payload });
+  // return resp.data;
+  await sleep(500); // simular latencia
+  return { ok: true };
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
+async function procesarOrden(order) {
+  console.log("→ Procesando orden:", order.id, order.order_number);
+
+  // (opcional) marca en "processing" para evitar duplicados si el poller corre en paralelo
+  await marcarStatus(order.id, "processing");
+
+  try {
+    const resp = await enviarABsale(order);
+
+    if (!resp || resp.ok !== true) {
+      throw new Error("Respuesta inválida de Bsale");
+    }
+
+    // Si todo OK
+    await marcarStatus(order.id, "processed", {
+      processed_at: new Date().toISOString(),
+    });
+    console.log("✔ Orden procesada:", order.id);
+  } catch (e) {
+    console.error("✖ Error procesando orden", order.id, e.message || e);
+    await marcarStatus(order.id, "error", {
+      error_message: String(e.message || e),
+      error_at: new Date().toISOString(),
+    });
+  }
+}
+
+async function procesarPendientes() {
+  const pendientes = await getPendientes();
+  if (!pendientes.length) {
+    return;
+  }
+  for (const ord of pendientes) {
+    await procesarOrden(ord);
+  }
+}
+
+// =====================
+// Poller loop
+// =====================
+async function startPoller() {
+  console.log("Poller arrancando en", START_DELAY_MS, "ms");
+  await sleep(START_DELAY_MS);
+
+  setInterval(async () => {
+    console.log("Poller tick", new Date().toISOString());
+    await procesarPendientes();
+  }, POLL_INTERVAL_MS);
+}
+
+// =====================
+// Rutas HTTP
+// =====================
+app.get("/", (_req, res) => {
+  res.status(200).json({ ok: true, message: "bsale-webhook alive" });
 });
 
+app.post("/api/bsale", async (req, res) => {
+  const { order_id } = req.body || {};
+  console.log(
+    "/api/bsale recibido:",
+    order_id,
+    "→ poller ejecutará en",
+    START_DELAY_MS,
+    "ms"
+  );
+  // No procesamos sincrónicamente aquí para no bloquear la respuesta
+  res.status(200).json({ ok: true });
+});
+
+// =====================
+// Precheck de conexión
+// =====================
+(async () => {
+  const hasUrl = !!SUPABASE_URL;
+  const hasKey = !!SUPABASE_SERVICE_ROLE_KEY;
+  console.log("SB precheck → url:", hasUrl, " key:", hasKey, " node:", process.version);
+
+  try {
+    const { error, count } = await supabase
+      .from(ORDERS_TABLE)
+      .select("id", { head: true, count: "exact" });
+
+    if (error) {
+      console.error("SB reachable pero error de Supabase:", error);
+    } else {
+      console.log(`SB reachable, ${ORDERS_TABLE} count estimado:`, count);
+    }
+  } catch (e) {
+    console.error("SB network error (causa 'fetch failed'):", e?.message || e);
+  }
+})();
+
+// =====================
+// Server bootstrap
+// =====================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server up on :${PORT}`);
+  startPoller();
+});
