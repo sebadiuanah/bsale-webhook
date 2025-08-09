@@ -1,111 +1,163 @@
-require('dotenv').config(); 
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
 app.use(express.json());
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+// ⚠️ Usa SERVICE ROLE en backend
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY,
+  { auth: { persistSession: false } }
+);
 
-app.post('/api/bsale', async (req, res) => {
-  const { order_id } = req.body;
+// Configurables
+const START_DELAY_MS   = 4000;   // espera antes de buscar la orden en /api/bsale
+const POLL_INTERVAL_MS = 30000;  // frecuencia del poller (30s)
+const MAX_BATCH        = 5;      // cuántas órdenes procesa por pasada el poller
 
-  if (!order_id) {
-    console.log('⚠️ Falta order_id');
-    return res.status(400).json({ error: 'Falta order_id' });
-  }
+// Helpers
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  console.log(`✅ Recibido pedido con ID: ${order_id}`);
+function mapItemsToBsale(details) {
+  return details.map(it => ({
+    quantity: it.quantity,
+    price: it.unit_price,
+    discount: it.discount_percentage,
+    code: it.products?.sku || ''
+  }));
+}
 
-  // Intentamos varias veces para esperar sincronización de Supabase
-  let order = null;
-  let orderError = null;
+async function fetchOrderAndItems(orderId) {
+  const { data: order, error: orderErr } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('id', orderId)
+    .single();
 
-  for (let intento = 1; intento <= 5; intento++) {
-    const result = await supabase
-      .from('orders')
-      .select('*')
-      .eq('id', order_id)
-      .single();
+  if (orderErr || !order) throw new Error('Orden no encontrada');
 
-    order = result.data;
-    orderError = result.error;
-
-    if (order) break;
-    console.log(`⌛ Intento ${intento}: orden aún no sincronizada...`);
-    await new Promise(resolve => setTimeout(resolve, 1000)); // esperar 1 segundo
-  }
-
-  if (orderError || !order) {
-    console.log('❌ Orden no encontrada o error:', orderError);
-    return res.status(404).json({ error: 'Orden no encontrada' });
-  }
-
-  console.log('📦 Orden obtenida:', order);
-
-  if (order.status !== 'pending') {
-    console.log('⚠️ Orden no está pendiente');
-    return res.status(400).json({ error: 'Orden no está pendiente' });
-  }
-
-  const { data: items, error: itemsError } = await supabase
+  const { data: items, error: itemsErr } = await supabase
     .from('order_items')
     .select('quantity, unit_price, discount_percentage, products(sku)')
-    .eq('order_id', order_id);
+    .eq('order_id', orderId);
 
-  if (itemsError || !items.length) {
-    console.log('❌ Error al obtener ítems:', itemsError);
-    return res.status(400).json({ error: 'No se encontraron ítems' });
-  }
+  if (itemsErr || !items?.length) throw new Error('No se encontraron ítems');
 
-  console.log('📦 Ítems obtenidos:', items);
+  return { order, items };
+}
 
-  const products = items.map(item => ({
-    quantity: item.quantity,
-    price: item.unit_price,
-    discount: item.discount_percentage,
-    code: item.products?.sku || ''
-  }));
+async function sendToBsale(items) {
+  const payload = {
+    document_type_id: 1,
+    office_id: 1,
+    client: {
+      activity: 'Venta al por mayor',
+      company: 'Mayorista Cliente',
+      identification: '99999999-9',
+    },
+    details: mapItemsToBsale(items),
+  };
 
-  console.log('🛍️ Productos formateados para Bsale:', products);
+  const resp = await axios.post('https://api.bsale.cl/v1/documents.json', payload, {
+    headers: {
+      Authorization: `Bearer ${process.env.BSALE_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    timeout: 30000,
+  });
 
-  try {
-    const response = await axios.post('https://api.bsale.cl/v1/documents.json', {
-      document_type_id: 1,
-      office_id: 1,
-      client: {
-        activity: 'Venta al por mayor',
-        company: 'Mayorista Cliente',
-        identification: '99999999-9'
-      },
-      details: products
-    }, {
-      headers: {
-        Authorization: `Bearer ${process.env.BSALE_TOKEN}`,
-        'Content-Type': 'application/json'
-      }
-    });
+  return resp.data;
+}
 
-    console.log('✅ Respuesta de Bsale:', response.data);
+async function processSingleOrder(orderId) {
+  const { order, items } = await fetchOrderAndItems(orderId);
+  const bsaleResp = await sendToBsale(items);
+  await supabase.from('orders').update({ status: 'enviada' }).eq('id', orderId);
+  return bsaleResp;
+}
 
-    await supabase
-      .from('orders')
-      .update({ status: 'enviada' })
-      .eq('id', order_id);
+/* =========================
+   1) Endpoint con timer
+   ========================= */
+app.post('/api/bsale', async (req, res) => {
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ error: 'Falta order_id' });
 
-    return res.status(200).json({ message: 'Nota enviada a Bsale', bsale_response: response.data });
+  // Respondemos rápido y procesamos con un pequeño delay
+  res.status(202).json({ message: 'Recibido. Se procesará en breve.' });
 
-  } catch (error) {
-    console.error('❌ Error al enviar a Bsale:', error.response?.data || error.message);
-    return res.status(500).json({ error: 'Error al enviar a Bsale' });
-  }
+  (async () => {
+    try {
+      console.log('📩 /api/bsale recibido:', order_id, `→ esperando ${START_DELAY_MS}ms`);
+      await sleep(START_DELAY_MS);
+      await processSingleOrder(order_id);
+      console.log('✅ Orden enviada a Bsale (timer):', order_id);
+    } catch (err) {
+      console.error('❌ Error en timer /api/bsale:', order_id, err?.message || err);
+      // opcional: marcar status='error'
+      await supabase.from('orders').update({ status: 'error' }).eq('id', order_id);
+    }
+  })();
 });
 
-const PORT = 3000;
+/* =========================
+   2) Poller en background
+   ========================= */
+async function pollPendingOrders() {
+  try {
+    // Toma algunas órdenes pendientes y las marca "processing" de forma optimista
+    const { data: pending, error } = await supabase
+      .from('orders')
+      .select('id')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(MAX_BATCH);
+
+    if (error || !pending?.length) return; // nada que hacer
+
+    for (const row of pending) {
+      const id = row.id;
+
+      // Lock optimista: sólo una instancia la toma
+      const { data: lockData, error: lockErr } = await supabase
+        .from('orders')
+        .update({ status: 'processing' })
+        .eq('id', id)
+        .eq('status', 'pending')
+        .select('id')
+        .single();
+
+      if (lockErr || !lockData) {
+        // otra pasada ya la tomó o cambió de estado
+        continue;
+      }
+
+      try {
+        console.log('🛠️ Poller procesando:', id);
+        await processSingleOrder(id);
+        console.log('✅ Poller OK:', id);
+      } catch (err) {
+        console.error('❌ Poller error:', id, err?.message || err);
+        // Devuelve a pending para que reintente en la próxima ronda
+        await supabase.from('orders').update({ status: 'pending' }).eq('id', id);
+      }
+    }
+  } catch (e) {
+    console.error('❌ Poller falló:', e?.message || e);
+  }
+}
+
+// Arranca el poller
+setInterval(pollPendingOrders, POLL_INTERVAL_MS);
+
+app.get('/health', (_, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
-
