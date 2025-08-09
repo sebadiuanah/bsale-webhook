@@ -17,8 +17,8 @@ const supabase = createClient(
 
 // Configurables
 const START_DELAY_MS   = 10000;   // espera antes de buscar la orden en /api/bsale
-const POLL_INTERVAL_MS = 30000;  // frecuencia del poller (30s)
-const MAX_BATCH        = 5;      // cuántas órdenes procesa por pasada el poller
+const POLL_INTERVAL_MS = 30000;   // frecuencia del poller (30s)
+const MAX_BATCH        = 5;       // cuántas órdenes procesa por pasada el poller
 
 // Helpers
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -106,24 +106,36 @@ app.post('/api/bsale', async (req, res) => {
 });
 
 /* =========================
-   2) Poller en background
+   2) Poller en background (con logs + primer tick inmediato)
    ========================= */
 async function pollPendingOrders() {
+  const startedAt = new Date().toISOString();
+  console.log(`🔁 Poller tick @ ${startedAt}`);
+
   try {
-    // Toma algunas órdenes pendientes y las marca "processing" de forma optimista
+    // Buscar órdenes en 'pending'
     const { data: pending, error } = await supabase
       .from('orders')
-      .select('id')
+      .select('id,status')
       .eq('status', 'pending')
-      .order('created_at', { ascending: true })
       .limit(MAX_BATCH);
 
-    if (error || !pending?.length) return; // nada que hacer
+    if (error) {
+      console.error('❌ Poller select error:', error.message);
+      return;
+    }
 
+    if (!pending || pending.length === 0) {
+      console.log('ℹ️ Poller: no hay órdenes pending en este tick');
+      return;
+    }
+
+    console.log(`📝 Poller: encontradas ${pending.length} órdenes`, pending.map(r => r.id));
+
+    // Intentar tomar cada orden con lock optimista
     for (const row of pending) {
       const id = row.id;
 
-      // Lock optimista: sólo una instancia la toma
       const { data: lockData, error: lockErr } = await supabase
         .from('orders')
         .update({ status: 'processing' })
@@ -133,7 +145,7 @@ async function pollPendingOrders() {
         .single();
 
       if (lockErr || !lockData) {
-        // otra pasada ya la tomó o cambió de estado
+        console.log(`↪️ Poller: orden ${id} no está pending (ya tomada o cambió de estado).`);
         continue;
       }
 
@@ -143,7 +155,7 @@ async function pollPendingOrders() {
         console.log('✅ Poller OK:', id);
       } catch (err) {
         console.error('❌ Poller error:', id, err?.message || err);
-        // Devuelve a pending para que reintente en la próxima ronda
+        // Devuelve a pending para reintentar más tarde
         await supabase.from('orders').update({ status: 'pending' }).eq('id', id);
       }
     }
@@ -152,7 +164,8 @@ async function pollPendingOrders() {
   }
 }
 
-// Arranca el poller
+// Primer tick inmediato y luego cada N segundos
+pollPendingOrders();
 setInterval(pollPendingOrders, POLL_INTERVAL_MS);
 
 app.get('/health', (_, res) => res.json({ ok: true }));
@@ -161,3 +174,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Servidor escuchando en http://localhost:${PORT}`);
 });
+
