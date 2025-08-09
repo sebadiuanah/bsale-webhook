@@ -8,15 +8,15 @@ const { createClient } = require("@supabase/supabase-js");
 const https = require("https");
 const dns = require("node:dns").promises;
 
-// =====================
-// ENV y configuración
-// =====================
 const app = express();
 app.use(cors({ origin: true, methods: ["GET","POST","OPTIONS"], allowedHeaders: ["Content-Type","Authorization"] }));
 app.use(express.json());
 
+// =====================
+// ENV y configuración
+// =====================
 const SUPABASE_URL_RAW = process.env.SUPABASE_URL || "";
-const SUPABASE_URL = SUPABASE_URL_RAW.trim();               // <- importante
+const SUPABASE_URL = SUPABASE_URL_RAW.trim();
 const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "").trim();
 
 const ORDERS_TABLE = process.env.ORDERS_TABLE || "orders";
@@ -24,15 +24,23 @@ const START_DELAY_MS = Number(process.env.START_DELAY_MS || 10000);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 30000);
 const MAX_BATCH = Number(process.env.MAX_BATCH || 5);
 
+// === Snippet para mostrar códigos ASCII ===
+function dumpCharCodes(label, s) {
+  const codes = Array.from(s).map(ch => ch.charCodeAt(0));
+  console.log(`${label} length=${s.length}`);
+  console.log(`${label} codes=`, codes.join(','));
+}
+dumpCharCodes("SUPABASE_URL raw", SUPABASE_URL_RAW);
+dumpCharCodes("SUPABASE_URL trim", SUPABASE_URL);
+
+// =====================
 // Cliente Supabase
+// =====================
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 
 // Helpers
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// =====================
-// Lógica principal
-// =====================
 async function getPendientes(limit = MAX_BATCH) {
   try {
     const { data, error } = await supabase
@@ -41,7 +49,6 @@ async function getPendientes(limit = MAX_BATCH) {
       .eq("status", "pending")
       .order("id", { ascending: true })
       .limit(limit);
-
     if (error) throw error;
     return data || [];
   } catch (e) {
