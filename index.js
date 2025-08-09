@@ -16,7 +16,7 @@ const supabase = createClient(
 );
 
 // Configurables
-const START_DELAY_MS   = 4000;   // espera antes de buscar la orden en /api/bsale
+const START_DELAY_MS   = 10000;   // espera antes de buscar la orden en /api/bsale
 const POLL_INTERVAL_MS = 30000;  // frecuencia del poller (30s)
 const MAX_BATCH        = 5;      // cuántas órdenes procesa por pasada el poller
 
