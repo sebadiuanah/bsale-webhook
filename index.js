@@ -12,6 +12,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios"); // placeholder si quieres llamar a Bsale
 const { createClient } = require("@supabase/supabase-js");
+const https = require("https");
 
 // =====================
 // Configuración general
@@ -79,27 +80,19 @@ async function marcarStatus(id, status, extra = {}) {
 
 // Placeholder: aquí iría tu llamada real a Bsale
 async function enviarABsale(order) {
-  // Ejemplo ficticio:
-  // const resp = await axios.post("https://bsale.tu-endpoint/api/nota-venta", { ...payload });
-  // return resp.data;
   await sleep(500); // simular latencia
   return { ok: true };
 }
 
 async function procesarOrden(order) {
   console.log("→ Procesando orden:", order.id, order.order_number);
-
-  // (opcional) marca en "processing" para evitar duplicados si el poller corre en paralelo
   await marcarStatus(order.id, "processing");
 
   try {
     const resp = await enviarABsale(order);
-
     if (!resp || resp.ok !== true) {
       throw new Error("Respuesta inválida de Bsale");
     }
-
-    // Si todo OK
     await marcarStatus(order.id, "processed", {
       processed_at: new Date().toISOString(),
     });
@@ -115,9 +108,7 @@ async function procesarOrden(order) {
 
 async function procesarPendientes() {
   const pendientes = await getPendientes();
-  if (!pendientes.length) {
-    return;
-  }
+  if (!pendientes.length) return;
   for (const ord of pendientes) {
     await procesarOrden(ord);
   }
@@ -152,7 +143,6 @@ app.post("/api/bsale", async (req, res) => {
     START_DELAY_MS,
     "ms"
   );
-  // No procesamos sincrónicamente aquí para no bloquear la respuesta
   res.status(200).json({ ok: true });
 });
 
@@ -164,6 +154,26 @@ app.post("/api/bsale", async (req, res) => {
   const hasKey = !!SUPABASE_SERVICE_ROLE_KEY;
   console.log("SB precheck → url:", hasUrl, " key:", hasKey, " node:", process.version);
 
+  // Diagnóstico de red
+  const agent = new https.Agent({ keepAlive: true });
+  const base = SUPABASE_URL.replace(/\/+$/, "");
+  const health = `${base}/auth/v1/health`;
+
+  try {
+    const r1 = await fetch("https://www.google.com", { agent });
+    console.log("NET google.com:", r1.status);
+  } catch (e) {
+    console.error("NET google.com fail:", e?.message, e?.cause?.code);
+  }
+
+  try {
+    const r2 = await fetch(health, { agent });
+    console.log("NET supabase health:", r2.status);
+  } catch (e) {
+    console.error("NET supabase fail:", e?.message, e?.cause?.code);
+  }
+
+  // Precheck Supabase
   try {
     const { error, count } = await supabase
       .from(ORDERS_TABLE)
@@ -175,7 +185,12 @@ app.post("/api/bsale", async (req, res) => {
       console.log(`SB reachable, ${ORDERS_TABLE} count estimado:`, count);
     }
   } catch (e) {
-    console.error("SB network error (causa 'fetch failed'):", e?.message || e);
+    console.error(
+      "SB network error (causa 'fetch failed'):",
+      e?.message,
+      e?.cause?.code || "",
+      e?.cause?.errno || ""
+    );
   }
 })();
 
