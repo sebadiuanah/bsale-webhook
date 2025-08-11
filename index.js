@@ -1,9 +1,10 @@
-// index.js — Stock Sync Bsale → Supabase (con backoff 429)
+// index.js — Stock Sync Bsale → Supabase (backoff + endpoints debug)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
+const dns = require('node:dns').promises;
 
 const app = express();
 app.use(cors({ origin: true, methods: ['GET','POST','OPTIONS'], allowedHeaders: ['Content-Type','Authorization'] }));
@@ -13,9 +14,9 @@ app.use(express.json());
 const SUPABASE_URL  = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_KEY  = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY;
 const BSALE_BASE    = (process.env.BSALE_BASE_URL || 'https://api.bsale.cl').replace(/\/+$/,'');
-const BSALE_TOKEN   = process.env.BSALE_TOKEN;                 // access_token
-const OFFICE_ID     = Number(process.env.BSALE_WAREHOUSE_ID || 1); // Office/warehouse id (p.ej. 1)
-const SYNC_EVERY_MS = Number(process.env.STOCK_SYNC_INTERVAL_MS || 5 * 60 * 1000); // 5 min
+const BSALE_TOKEN   = process.env.BSALE_TOKEN;
+const OFFICE_ID     = Number(process.env.BSALE_WAREHOUSE_ID || 1);
+const SYNC_EVERY_MS = Number(process.env.STOCK_SYNC_INTERVAL_MS || 5 * 60 * 1000);
 const PORT          = process.env.PORT || 10000;
 
 // ---------- Clients ----------
@@ -32,7 +33,7 @@ const BSALE = axios.create({
 });
 
 // ---------- Helpers ----------
-const log = (...a) => console.log(...a);
+const log  = (...a) => console.log(...a);
 const warn = (...a) => console.warn(...a);
 const err  = (...a) => console.error(...a);
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -57,7 +58,7 @@ async function bsaleGet(path, params = {}, tries = 4, delay = 1200) {
   return { status: 429, data: { error: 'max retries' } };
 }
 
-// ---------- Sanity at boot ----------
+// ---------- Sanity al iniciar ----------
 (async () => {
   log('Sanity → SUPABASE_URL:', SUPABASE_URL, '\nSanity → service_role set:', !!SUPABASE_KEY);
   try {
@@ -126,14 +127,13 @@ async function syncStockOnce() {
 // ---------- Cron interno ----------
 function startStockCron() {
   log(`StockSync → cron cada ${Math.round(SYNC_EVERY_MS/1000)}s (officeId=${OFFICE_ID})`);
-  // Retraso inicial mayor para evitar 429 al boot
   setTimeout(() => {
     syncStockOnce();
     setInterval(syncStockOnce, SYNC_EVERY_MS);
-  }, 15000);
+  }, 15000); // retraso inicial para evitar ráfagas
 }
 
-// ---------- HTTP endpoints ----------
+// ---------- Endpoints HTTP ----------
 app.post('/api/stock/sync', async (_req, res) => {
   const r = await syncStockOnce();
   res.status(r.ok ? 200 : 500).json(r);
@@ -150,9 +150,32 @@ app.get('/api/stock/:sku', async (req, res) => {
   res.json({ ok: true, data, available: (data?.stock_qty ?? 0) - (data?.reserved_qty ?? 0) });
 });
 
+// ---------- Endpoints de diagnóstico ----------
+app.get('/debug/supa', async (_req, res) => {
+  try {
+    const url  = (process.env.SUPABASE_URL || '').trim();
+    const host = new URL(url).host;
+    const a = await dns.lookup(host).catch(e => ({ error: e.code || e.message }));
+    const r = await fetch(`${url.replace(/\/+$/,'')}/rest/v1/`, {
+      headers: { apikey: process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY }
+    }).then(x => ({ status: x.status })).catch(e => ({ fetch_error: e.cause?.code || e.message }));
+    res.json({ url, host, dns: a, rest: r });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/debug/dns', async (_req, res) => {
+  try {
+    const a = await dns.lookup('supabase.co').catch(e => ({ error: e.code || e.message }));
+    res.json({ supabase_co: a });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- Start ----------
 startStockCron();
-
 app.listen(PORT, () => {
   log(`Server up on :${PORT}`);
 });
