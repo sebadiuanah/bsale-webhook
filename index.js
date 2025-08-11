@@ -10,9 +10,7 @@ app.use(express.json());
 // === ENV & sanity ===
 const RAW_URL = (process.env.SUPABASE_URL || '').trim();
 const SUPABASE_URL = RAW_URL.replace(/\/+$/, ''); // sin slash final
-const SUPABASE_HOST = (() => {
-  try { return new URL(SUPABASE_URL).host; } catch { return '(URL inválida)'; }
-})();
+const SUPABASE_HOST = (() => { try { return new URL(SUPABASE_URL).host; } catch { return '(URL inválida)'; } })();
 const SERVICE_ROLE = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '').trim();
 
 console.log('Sanity ➔ SUPABASE_URL:', SUPABASE_URL || '(vacío)');
@@ -26,38 +24,55 @@ if (!SERVICE_ROLE) {
   console.error('⚠️  Falta SUPABASE_SERVICE_ROLE_KEY.');
 }
 
-// === Supabase client (no persiste sesión en servidor)
+// Cliente Supabase (por si lo necesitas más adelante)
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
-// === Helpers ===
-async function pingSupabase(maxTries = 4) {
-  const healthURL = `${SUPABASE_URL}/auth/v1/health`;
+// === Ping: DNS + Auth Settings (requiere SERVICE_ROLE) ===
+async function pingSupabaseAuth(maxTries = 4) {
+  const url = `${SUPABASE_URL}/auth/v1/settings`;
   let lastErr;
+
   for (let i = 1; i <= maxTries; i++) {
     try {
-      // 1) DNS lookup del host
+      // 1) DNS lookup
       const dnsInfo = await dns.lookup(SUPABASE_HOST);
       console.log(`DNS ➔ ${SUPABASE_HOST} -> ${dnsInfo.address}`);
 
-      // 2) Health check HTTP
-      const r = await axios.get(healthURL, { timeout: 5000 });
-      if (r.status >= 200 && r.status < 300) {
-        console.log('✓ Ping Supabase OK');
-        return true;
+      // 2) Auth settings (200 esperado)
+      const r = await axios.get(url, {
+        timeout: 8000,
+        headers: {
+          apikey: SERVICE_ROLE,
+          Authorization: `Bearer ${SERVICE_ROLE}`,
+        },
+        // Evita seguir redirects raros que manchen el status real
+        maxRedirects: 0,
+        validateStatus: () => true,
+      });
+
+      console.log(`HTTP ➔ GET ${url} -> ${r.status}`);
+      if (r.status === 200 && r.data) {
+        console.log('✓ Ping Supabase (auth settings) OK');
+        return { ok: true, status: r.status };
       }
-      throw new Error(`HTTP ${r.status}`);
+
+      throw Object.assign(new Error(`HTTP ${r.status}`), { response: r });
     } catch (err) {
       lastErr = err;
       const code = err.code || (err.response && err.response.status);
-      console.error(`✗ Intento ${i}/${maxTries} ping falló (${code || err.message})`);
+      const body = err.response && (typeof err.response.data === 'string'
+        ? err.response.data.slice(0, 200)
+        : JSON.stringify(err.response.data || {})).slice(0, 200);
+
+      console.error(`✗ Intento ${i}/${maxTries} falló (${code || err.message})${body ? ` body=${body}` : ''}`);
       await new Promise(r => setTimeout(r, 1000 * i));
     }
   }
   console.error('✗ Ping Supabase falló:', lastErr && (lastErr.code || lastErr.message));
-  return false;
+  return { ok: false, error: lastErr && (lastErr.code || lastErr.message) };
 }
 
-// === Endpoints de diagnóstico ===
+// === Endpoints de debug ===
 app.get('/debug/env', (_req, res) => {
   res.json({
     SUPABASE_URL,
@@ -67,21 +82,18 @@ app.get('/debug/env', (_req, res) => {
 });
 
 app.get('/debug/ping', async (_req, res) => {
-  const ok = await pingSupabase(1);
-  res.status(ok ? 200 : 500).json({ ok });
+  const r = await pingSupabaseAuth(1);
+  res.status(r.ok ? 200 : 500).json(r);
 });
 
-app.get('/', (_req, res) => {
-  res.send('OK');
-});
+app.get('/', (_req, res) => res.send('OK'));
 
 // === Arranque ===
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, async () => {
   console.log(`Server up on :${PORT}`);
-  const ok = await pingSupabase();
-  if (!ok) {
-    console.log('Sugerencia: revisa EXACTITUD de SUPABASE_URL y que no tenga espacios ni comillas.');
+  const r = await pingSupabaseAuth();
+  if (!r.ok) {
+    console.log('Sugerencia: valida URL exacta (Project URL) y SERVICE_ROLE_KEY. Sin comillas ni slash final.');
   }
 });
-
