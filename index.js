@@ -39,9 +39,9 @@ const SUPABASE_ORDER_ITEMS_SKU_COL = process.env.SUPABASE_ORDER_ITEMS_SKU_COL ||
 const SUPABASE_ORDER_ITEMS_QTY_COL = process.env.SUPABASE_ORDER_ITEMS_QTY_COL || 'quantity';
 
 // Timers
-const START_DELAY_MS   = Number(process.env.START_DELAY_MS || 10000);   // 10s
+const START_DELAY_MS   = Number(process.env.START_DELAY_MS || 10000);    // 10s
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 300000); // 300s = 5m
-const MAX_PAGES_STOCK  = Number(process.env.MAX_PAGES_STOCK || 50);     // tope de paginado Bsale
+const MAX_PAGES_STOCK  = Number(process.env.MAX_PAGES_STOCK || 50);      // tope de paginado Bsale
 
 console.log('Sanity ➔ SUPABASE_URL:', SUPABASE_URL || '(vacío)');
 console.log('Sanity ➔ host:', SUPABASE_HOST);
@@ -104,8 +104,7 @@ function bsaleHeaders() {
 
 /**
  * Obtiene una página de stock desde Bsale.
- * Endpoint usual: /v1/stocks.json?officeId=<id>&page=<n>&limit=200&expand=variant
- * Si tu instancia usa otro endpoint, ajusta aquí la URL.
+ * Endpoint: /v1/stocks.json?officeId=<id>&page=<n>&limit=200&expand=variant
  */
 async function fetchBsaleStockPage(page = 1) {
   const url = `${BSALE_API_BASE}/v1/stocks.json?officeId=${encodeURIComponent(BSALE_OFFICE_ID)}&page=${page}&limit=200&expand=variant`;
@@ -115,14 +114,12 @@ async function fetchBsaleStockPage(page = 1) {
 }
 
 /**
- * Normaliza respuesta de Bsale a pares { sku, quantity }
- * Ajusta según tu payload real: algunos usan item.variant.code / item.variant.sku / item.code
+ * **AJUSTE**: usar variant.code como SKU y quantity como stock.
  */
 function mapStocksToSkuQty(items = []) {
   return items.map((it) => {
-    const variant = it.variant || {};
-    const sku = (variant.code || variant.sku || it.code || '').toString().trim();
-    const qty = Number(it.stock || it.quantity || 0);
+    const sku = ((it.variant && it.variant.code) || '').toString().trim();
+    const qty = Number(it.quantity || 0);
     return { sku, quantity: qty };
   }).filter(x => x.sku);
 }
@@ -173,9 +170,6 @@ async function runStockSync() {
 
 // ===================== /api/bsale (CREAR DOCUMENTO) =====================
 
-/**
- * Carga orden + items desde Supabase por order_id
- */
 async function getOrderWithItems(orderId) {
   const { data: order, error: e1 } = await supabase
     .from(SUPABASE_ORDERS_TABLE)
@@ -196,37 +190,22 @@ async function getOrderWithItems(orderId) {
   return { order, items: items || [] };
 }
 
-/**
- * Construye payload Bsale para crear documento/nota.
- * ⚠️ Ajusta a tu tipo de documento real: fields, ids, impuestos, precios.
- */
 function buildBsaleDocumentPayload({ order, items }) {
-  // Mapeo básico: SKU + cantidad
   const details = items.map(it => ({
     code: it[SUPABASE_ORDER_ITEMS_SKU_COL],
     quantity: Number(it[SUPABASE_ORDER_ITEMS_QTY_COL] || 1),
-    // opcionales: price, discount, comment, etc.
   }));
 
   const payload = {
-    // document_type_id puede ser requerido según tu flujo (boleta, nota de venta, etc.)
     ...(BSALE_DOC_TYPE_ID ? { document_type_id: Number(BSALE_DOC_TYPE_ID) } : {}),
-    emission_date: new Date().toISOString().slice(0, 10), // YYYY-MM-DD
+    emission_date: new Date().toISOString().slice(0, 10),
     details,
-    // cliente opcional (ajusta a tus campos reales)
-    // buyer: { name: order.customer_name, identification: order.rut },
-    // office_id para emitir en la misma oficina (opcional):
     ...(BSALE_OFFICE_ID ? { office_id: Number(BSALE_OFFICE_ID) } : {}),
   };
 
   return payload;
 }
 
-/**
- * Envía el documento a Bsale.
- * Endpoint común: /v1/documents.json (depende de tu tipo de documento)
- * Si tu cuenta usa /v1/notes.json u otro, cámbialo aquí.
- */
 async function sendBsaleDocument(payload) {
   const url = `${BSALE_API_BASE}/v1/documents.json`;
   const r = await axios.post(url, payload, {
@@ -290,10 +269,9 @@ app.listen(PORT, async () => {
     console.log('Sugerencia: valida URL exacta (Project URL) y SERVICE_ROLE_KEY.');
   }
 
-  // Arranque diferido del poller de stock
+  // Arranque diferido del poller de stock (CRON ACTIVADO)
   setTimeout(() => {
     runStockSync(); // primera pasada
     setInterval(runStockSync, POLL_INTERVAL_MS);
   }, START_DELAY_MS);
 });
-
