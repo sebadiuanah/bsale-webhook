@@ -3,6 +3,7 @@
  * - Ping Supabase (auth settings) para verificar URL + SERVICE_ROLE
  * - StockSync: trae stock desde Bsale y lo upsertea por SKU en Supabase
  * - /api/bsale: crea documento/nota en Bsale a partir de order_id en Supabase
+ * - /debug/stock: diagnóstico interactivo de Bsale (stocks)
  */
 
 require('dotenv').config();
@@ -23,7 +24,7 @@ const SERVICE_ROLE = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPAB
 
 const BSALE_API_BASE = (process.env.BSALE_API_BASE || 'https://api.bsale.cl').replace(/\/+$/, '');
 const BSALE_TOKEN = (process.env.BSALE_TOKEN || '').trim();
-const BSALE_OFFICE_ID = process.env.BSALE_OFFICE_ID || '1'; // oficina para stock
+const BSALE_OFFICE_ID = (process.env.BSALE_OFFICE_ID || '1').toString(); // oficina para stock
 const BSALE_DOC_TYPE_ID = process.env.BSALE_DOC_TYPE_ID || ''; // opcional, id de tipo de documento/nota
 
 // Tablas/columnas Supabase (ajústalas a tu esquema real)
@@ -57,6 +58,9 @@ if (!SUPABASE_URL || !/^https:\/\/.+\.supabase\.co$/i.test(SUPABASE_URL)) {
 if (!SERVICE_ROLE) {
   console.error('⚠️  Falta SUPABASE_SERVICE_ROLE_KEY.');
 }
+if (!BSALE_TOKEN) {
+  console.error('⚠️  Falta BSALE_TOKEN en env (requerido para Bsale).');
+}
 
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE, { auth: { persistSession: false } });
 
@@ -86,8 +90,8 @@ async function pingSupabaseAuth(maxTries = 3) {
       throw Object.assign(new Error(`HTTP ${r.status}`), { response: r });
     } catch (err) {
       lastErr = err;
-      const code = err.code || (err.response && err.response.status);
-      console.error(`✗ Ping intento ${i}/${maxTries} falló (${code || err.message})`);
+      const code = err?.code || err?.response?.status;
+      console.error(`✗ Ping intento ${i}/${maxTries} falló (${code || err?.message})`);
       await new Promise(r => setTimeout(r, 1000 * i));
     }
   }
@@ -103,18 +107,39 @@ function bsaleHeaders() {
 }
 
 /**
- * Obtiene una página de stock desde Bsale.
- * Endpoint: /v1/stocks.json?officeId=<id>&page=<n>&limit=200&expand=variant
+ * Construye URL de stocks. Si `noOffice=1` en query, prueba sin officeId.
  */
-async function fetchBsaleStockPage(page = 1) {
-  const url = `${BSALE_API_BASE}/v1/stocks.json?officeId=${encodeURIComponent(BSALE_OFFICE_ID)}&page=${page}&limit=200&expand=variant`;
-  const r = await axios.get(url, { headers: bsaleHeaders(), timeout: 15000, validateStatus: () => true });
-  if (r.status !== 200) throw new Error(`Bsale stocks HTTP ${r.status}`);
+function stocksUrl(page = 1, noOffice = false) {
+  const base = `${BSALE_API_BASE}/v1/stocks.json`;
+  const qp = new URLSearchParams({
+    page: String(page),
+    limit: '200',
+    expand: 'variant',
+    ...(noOffice ? {} : { officeId: BSALE_OFFICE_ID }),
+  });
+  return `${base}?${qp.toString()}`;
+}
+
+/**
+ * Obtiene una página de stock desde Bsale con logs detallados.
+ */
+async function fetchBsaleStockPage(page = 1, noOffice = false) {
+  const url = stocksUrl(page, noOffice);
+  const r = await axios.get(url, {
+    headers: bsaleHeaders(),
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+  console.log(`HTTP ➔ GET ${url} -> ${r.status}`);
+  if (r.status !== 200) {
+    const body = typeof r.data === 'string' ? r.data.slice(0, 300) : JSON.stringify(r.data || {}).slice(0, 300);
+    throw new Error(`Bsale stocks HTTP ${r.status} body=${body}`);
+  }
   return r.data; // { count, next, previous, items: [...] }
 }
 
 /**
- * **AJUSTE**: usar variant.code como SKU y quantity como stock.
+ * Usar variant.code como SKU y quantity como stock.
  */
 function mapStocksToSkuQty(items = []) {
   return items.map((it) => {
@@ -145,8 +170,25 @@ async function runStockSync() {
   let total = 0;
 
   try {
+    // intenta con officeId; si falla 404/401/403, reintenta sin officeId
+    let useNoOffice = false;
+
     for (let page = 1; page <= MAX_PAGES_STOCK; page++) {
-      const data = await fetchBsaleStockPage(page);
+      let data;
+      try {
+        data = await fetchBsaleStockPage(page, useNoOffice);
+      } catch (e) {
+        const status = e?.response?.status || /HTTP (\d{3})/.exec(e?.message || '')?.[1];
+        // si es 401/403/404 en la primera página con officeId, reintenta sin officeId
+        if (!useNoOffice && page === 1 && ['401','403','404'].includes(String(status))) {
+          console.warn(`⚠️ StockSync: status ${status} con officeId=${BSALE_OFFICE_ID}. Reintentando sin officeId…`);
+          useNoOffice = true;
+          data = await fetchBsaleStockPage(page, true);
+        } else {
+          throw e;
+        }
+      }
+
       const items = data.items || data;
       if (!items || !items.length) {
         console.log(`StockSync: página ${page} sin ítems, fin.`);
@@ -164,7 +206,18 @@ async function runStockSync() {
 
     console.log(`✅ StockSync: completado. Total upserts: ${total}`);
   } catch (err) {
-    console.error('❌ StockSync error:', err.message || err);
+    const status = err?.response?.status;
+    const body = typeof err?.response?.data === 'string'
+      ? err.response.data.slice(0, 400)
+      : JSON.stringify(err?.response?.data || {}).slice(0, 400);
+    console.error('❌ StockSync error:',
+      {
+        message: err?.message,
+        status,
+        body,
+        headers: err?.response?.headers,
+      }
+    );
   }
 }
 
@@ -230,6 +283,7 @@ app.get('/debug/env', (_req, res) => {
     SERVICE_ROLE_present: Boolean(SERVICE_ROLE),
     BSALE_API_BASE,
     BSALE_OFFICE_ID,
+    BSALE_TOKEN_present: Boolean(BSALE_TOKEN),
     SUPABASE_STOCK_TABLE,
   });
 });
@@ -237,6 +291,31 @@ app.get('/debug/env', (_req, res) => {
 app.get('/debug/ping', async (_req, res) => {
   const ok = await pingSupabaseAuth(1);
   res.status(ok ? 200 : 500).json({ ok });
+});
+
+/**
+ * Diagnóstico: prueba lectura de stocks en vivo.
+ * /debug/stock?page=1&noOffice=1
+ */
+app.get('/debug/stock', async (req, res) => {
+  try {
+    const page = Number(req.query.page || '1');
+    const noOffice = req.query.noOffice === '1';
+    const data = await fetchBsaleStockPage(page, noOffice);
+    const mapped = mapStocksToSkuQty(data.items || data);
+    res.json({
+      page,
+      count: (data.items || data || []).length,
+      sample: mapped.slice(0, 5),
+      next: data.next || null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err?.message,
+      status: err?.response?.status,
+      body: err?.response?.data || null,
+    });
+  }
 });
 
 app.post('/api/bsale', async (req, res) => {
@@ -253,8 +332,8 @@ app.post('/api/bsale', async (req, res) => {
     console.log('✓ Documento Bsale creado:', resp && (resp.id || resp.number || 'OK'));
     return res.status(201).json({ ok: true, bsale: resp });
   } catch (err) {
-    console.error('✗ /api/bsale error:', err.message || err);
-    return res.status(500).json({ ok: false, error: err.message || 'Error' });
+    console.error('✗ /api/bsale error:', err?.message || err);
+    return res.status(500).json({ ok: false, error: err?.message || 'Error' });
   }
 });
 
